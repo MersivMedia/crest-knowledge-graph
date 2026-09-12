@@ -1,0 +1,9 @@
+# Core — stdlib does most of the work
+pymupdf>=1.24          # PDF page rendering + text-layer inspection
+
+# VLM serving (install on the GPU box, not the control machine)
+# vllm>=0.6
+
+# Optional — graph and vector stores for later milestones
+# neo4j>=5.0
+# qdrant-client>=1.9

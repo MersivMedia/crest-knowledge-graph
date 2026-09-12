@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.key
+*credentials*.json
+google_token.json
+
+# Data — never commit the corpus or derived state
+*.zip
+*.db
+*.pdf
+*.jpg
+benchmark_results.json
+coverage.json
+quarantine/
+crest_bench/
+PRD.html
