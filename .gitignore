@@ -9,6 +9,9 @@ google_token.json
 # Data — never commit the corpus or derived state
 *.zip
 *.db
+# ...except the manifest, which is mirrored here deliberately (see manifest/README.md)
+!manifest/crest1.zip
+!manifest/crest2.zip
 *.pdf
 *.jpg
 benchmark_results.json

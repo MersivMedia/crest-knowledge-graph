@@ -5,8 +5,15 @@ Tooling to ingest the CIA's declassified **CREST** archive — 934,738 documents
 self-hosted vision-language model and a Hermes agent harness that learns from
 its own failures.
 
-**Full corpus cost: ~$2,400.** Most of the expensive part is already done by
-someone else; this repo is mostly about finding it and not re-paying for it.
+**Full corpus cost: ~$2,400.** Vision analysis runs over all 12,172,653 pages —
+we are not reusing anyone's OCR. That is a deliberate choice: existing OCR is
+text-only, and it silently discards the maps, photographs, stamps, seals,
+redaction bars and handwritten marginalia that make these documents
+intelligible. A VLM reads the page as a page.
+
+The cost is low because the work is self-hosted on rented GPUs (~$1,600 of
+compute) rather than billed per API call, and because the 934,738-row index
+already exists — mirrored in [`manifest/`](manifest/) so it cannot disappear.
 
 ---
 
@@ -14,6 +21,7 @@ someone else; this repo is mostly about finding it and not re-paying for it.
 
 | File | Purpose |
 |---|---|
+| `manifest/` | **The full 934,738-row CREST index, mirrored** (94 MB) |
 | `PRD.md` | Product requirements + full cost analysis, every figure sourced |
 | `AGENT_HARNESS.md` | How to run the learning loop in Hermes (copy-paste prompts) |
 | `schema.py` | JSON contract, prompt, validator, hallucination check |
@@ -32,8 +40,11 @@ Michael Morisy founded MuckRock, whose lawsuit forced the CREST release. 94 MB,
 934,738 rows, every field populated. Mirror it; it hangs off one unmaintained
 account with 3 stars.
 
-**Much of the OCR already exists.** archive.org holds 275,008 CREST items with
-ABBYY OCR *and per-word bounding boxes* (`_djvu.xml`). Free.
+**Existing OCR exists but we are not relying on it.** archive.org holds 275,008
+CREST items with ABBYY OCR and per-word bounding boxes (`_djvu.xml`), free — a
+useful *reference* for benchmarking transcription quality. But it is text-only
+and covers an unresolved 23–88% of the corpus. We run vision over everything
+instead: uniform coverage, and it captures what OCR structurally cannot.
 
 **cia.gov is unusable programmatically.** Akamai Bot Manager returns a
 `bm-verify` challenge to every scripted request. The Wayback Machine's `id_`
@@ -67,21 +78,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Get the manifest (94 MB)
+### 2. Verify the manifest
+
+The full index ships **in this repo** under `manifest/` — 94 MB, already
+cloned. Confirm it is intact:
 
 ```bash
-mkdir -p ~/.hermes/data/crest-archive
-cd ~/.hermes/data/crest-archive
-curl -sL -o crest1.zip "https://raw.githubusercontent.com/morisy/ci-trend-explorer/master/Crest%201.zip"
-curl -sL -o crest2.zip "https://raw.githubusercontent.com/morisy/ci-trend-explorer/master/Crest%202.zip"
-sha256sum crest*.zip > SHA256SUMS
-cd -
+cd manifest && sha256sum -c SHA256SUMS && cd ..
+# crest1.zip: OK
+# crest2.zip: OK
 ```
+
+Upstream original: [`morisy/ci-trend-explorer`](https://github.com/morisy/ci-trend-explorer)
+(3 stars, unmaintained since 2017). It is mirrored here because a nine-year
+lawsuit should not depend on one personal account staying online. See
+[`manifest/README.md`](manifest/README.md).
 
 ### 3. Build the index
 
 ```bash
-python manifest_to_sqlite.py
+python manifest_to_sqlite.py --data-dir manifest
 ```
 
 Expected:
