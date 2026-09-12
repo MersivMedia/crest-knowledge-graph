@@ -17,58 +17,142 @@ already exists — mirrored in [`manifest/`](manifest/) so it cannot disappear.
 
 ---
 
-## What is here
+## Why self-hosted, not an API
 
-| File | Purpose |
-|---|---|
-| `manifest/` | **The full 934,738-row CREST index, mirrored** (94 MB) |
-| `PRD.md` | Product requirements + full cost analysis, every figure sourced |
-| `AGENT_HARNESS.md` | How to run the learning loop in Hermes (copy-paste prompts) |
-| `schema.py` | JSON contract, prompt, validator, hallucination check |
-| `manifest_to_sqlite.py` | 934,738-row manifest → indexed SQLite |
-| `fetch_document.py` | Fetch one document, preferring already-OCR'd sources |
-| `coverage_audit.py` | Measure the three-way source split |
-| `benchmark_vlm.py` | Benchmark a VLM before committing GPU-days |
-| `ingest.py` | Hot-path processing + quarantine + failure reporting |
+**Hosted APIs refuse this content.** Measured, not assumed: a production API
+declined to extract structured data from coup-operation material, stating it
+would refuse *"even if this were a real declassified document."*
 
----
+CREST is full of such material — PBSUCCESS, PBFORTUNE, ZRRIFLE, Phoenix,
+MKUltra. Refusals would cluster on exactly the documents researchers care about
+most, and they arrive as HTTP 200 with prose, so they land in the pipeline as
+malformed records rather than errors. An archive that silently omits the
+Guatemala coup while faithfully indexing cafeteria memos is worse than no
+archive.
 
-## Key findings (so you don't repeat the work)
-
-**The full manifest already exists.** `morisy/ci-trend-explorer` on GitHub —
-Michael Morisy founded MuckRock, whose lawsuit forced the CREST release. 94 MB,
-934,738 rows, every field populated. Mirror it; it hangs off one unmaintained
-account with 3 stars.
-
-**Existing OCR exists but we are not relying on it.** archive.org holds 275,008
-CREST items with ABBYY OCR and per-word bounding boxes (`_djvu.xml`), free — a
-useful *reference* for benchmarking transcription quality. But it is text-only
-and covers an unresolved 23–88% of the corpus. We run vision over everything
-instead: uniform coverage, and it captures what OCR structurally cannot.
-
-**cia.gov is unusable programmatically.** Akamai Bot Manager returns a
-`bm-verify` challenge to every scripted request. The Wayback Machine's `id_`
-raw-content path serves the same PDFs without the wall.
-
-**Hosted APIs refuse this content.** Measured: a production API refused to
-extract structured data from coup-operation material, explicitly stating that
-it would refuse *"even if this were a real declassified document."* CREST is
-full of such material. **Self-host open weights** — see `PRD.md` §4.2.
-
-**Wayback CREST PDFs have no text layer** (0 of 15 tested). Don't confuse them
-with the `/readingroom/docs/` captures, which do — that's a different corpus.
+Open weights on your own GPU have no policy layer, are deterministic at
+`temperature=0`, and cannot be deprecated mid-project. Full evidence in
+[`PRD.md`](PRD.md) §4.2.
 
 ---
 
-## Setup
+# Setup
 
-### Prerequisites
+Everything below assumes a **freshly rented GPU box** (RunPod, Vast.ai, Lambda
+— $1.49–3.29/hr for an H100). Work through the parts in order.
 
-- Python 3.10+
-- ~4 TB storage for the full corpus (a pilot needs ~5 GB)
-- A GPU for the VLM stage — rented is fine (see step 5)
+---
 
-### 1. Clone and install
+## Part 1 — Install the Hermes agent harness
+
+Do this first. The harness is what turns a one-off script run into a pipeline
+that improves between batches.
+
+### 1.1 Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
+
+### 1.2 Run the setup wizard
+
+```bash
+hermes setup
+```
+
+Pick any provider you already have a key for — this model drives the *agent*
+(reading failure reports, proposing fixes), not the page-transcription work.
+A mid-tier model is plenty. The heavy lifting is done by the local VLM you
+install in Part 2.
+
+### 1.3 Verify
+
+```bash
+hermes doctor
+```
+
+Fix anything it flags before continuing. Then confirm the agent runs:
+
+```bash
+hermes chat -q "Reply with OK if you can run shell commands."
+```
+
+---
+
+## Part 2 — Install and serve the vision model
+
+This is the model that actually reads the 12.2M pages.
+
+### 2.1 Install vLLM
+
+```bash
+python3 -m venv ~/vllm-env
+source ~/vllm-env/bin/activate
+pip install vllm
+```
+
+### 2.2 Download and serve Qwen3-VL
+
+**Qwen3-VL** is the recommended model: OCR across 32 languages, explicitly
+robust to low light, blur and tilt — which is exactly what 1950s microfilm
+produces. OCRBench 896 vs Gemma-3's 480. Alternatives worth benchmarking:
+InternVL3, Pixtral, Molmo.
+
+Weights download automatically on first serve (~16 GB for the 8B):
+
+```bash
+vllm serve Qwen/Qwen3-VL-8B-Instruct \
+    --port 8000 \
+    --limit-mm-per-prompt image=1 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.90
+```
+
+Leave this running. Open a second shell for everything below.
+
+> **Not Grok.** xAI's open weights (Grok-1, Grok-2) are text-only — no released
+> multimodal weights, so they cannot read page images.
+
+### 2.3 Verify the server
+
+```bash
+curl -s http://localhost:8000/v1/models | python3 -m json.tool
+```
+
+You should see `Qwen/Qwen3-VL-8B-Instruct` listed.
+
+### 2.4 Point Hermes at the local model
+
+So the agent can inspect pages itself when triaging failures:
+
+```bash
+hermes config set auxiliary.vision.provider openai
+hermes config set auxiliary.vision.base_url http://localhost:8000/v1
+hermes config set auxiliary.vision.model Qwen/Qwen3-VL-8B-Instruct
+hermes config set auxiliary.vision.api_key local
+```
+
+Restart any running Hermes session for this to take effect.
+
+Optionally drive the *agent itself* from the same local model — fully offline,
+no API keys anywhere:
+
+```bash
+hermes config set model.provider openai
+hermes config set model.base_url http://localhost:8000/v1
+hermes config set model.default Qwen/Qwen3-VL-8B-Instruct
+hermes config set model.api_key local
+```
+
+An 8B model is weak for the agent's reasoning work. Prefer a hosted model for
+the agent and keep the local VLM for pages — the agent makes a few hundred
+calls, the VLM makes 12 million.
+
+---
+
+## Part 3 — Install this repo and its skill
+
+### 3.1 Clone
 
 ```bash
 git clone https://github.com/MersivMedia/crest-knowledge-graph.git
@@ -78,10 +162,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify the manifest
+### 3.2 Install the skill into Hermes
 
-The full index ships **in this repo** under `manifest/` — 94 MB, already
-cloned. Confirm it is intact:
+```bash
+mkdir -p ~/.hermes/skills/research
+cp -r skills/cia-crest-archive ~/.hermes/skills/research/
+hermes skills list | grep crest
+```
+
+The skill carries everything learned building this: which sources work, which
+are bot-walled, the measured cost model, and the traps (encoded filenames,
+contaminated search tags, sample sizes that lie).
+
+### 3.3 Verify the manifest
+
+The full 934,738-row index ships **in this repo** under `manifest/` — 94 MB,
+already cloned. Confirm it is intact:
 
 ```bash
 cd manifest && sha256sum -c SHA256SUMS && cd ..
@@ -90,17 +186,15 @@ cd manifest && sha256sum -c SHA256SUMS && cd ..
 ```
 
 Upstream original: [`morisy/ci-trend-explorer`](https://github.com/morisy/ci-trend-explorer)
-(3 stars, unmaintained since 2017). It is mirrored here because a nine-year
-lawsuit should not depend on one personal account staying online. See
+(3 stars, unmaintained since 2017). Mirrored here because a nine-year lawsuit
+should not depend on one personal account staying online. See
 [`manifest/README.md`](manifest/README.md).
 
-### 3. Build the index
+### 3.4 Build the index
 
 ```bash
 python manifest_to_sqlite.py --data-dir manifest
 ```
-
-Expected:
 
 ```
   documents : 934,738
@@ -109,48 +203,23 @@ Expected:
   db        : ~/.hermes/data/crest-archive/crest.db (498 MB)
 ```
 
-### 4. Verify document fetching
+### 3.5 Verify document fetching
 
 ```bash
 python fetch_document.py CIA-RDP80T00294A001200090027-4
+# source : archive.org   ocr : abbyy   pages : 8   words pg0 : 503
 ```
 
-Expected — text *and* word-level bounding boxes, at no cost:
-
-```
-doc      : CIA-RDP80T00294A001200090027-4
-source   : archive.org
-ocr      : abbyy
-pages    : 8
-words pg0: 503
-```
-
-Try one archive.org lacks, to confirm the Wayback fallback:
+And one archive.org lacks, to confirm the Wayback fallback:
 
 ```bash
 python fetch_document.py CIA-RDP55-00166A000200050081-9
 # source : wayback   ocr : required
 ```
 
-### 5. Stand up the VLM
+---
 
-Rent a GPU (RunPod, Vast.ai, Lambda — $1.49–3.29/hr for an H100), then:
-
-```bash
-pip install vllm
-vllm serve Qwen/Qwen3-VL-8B-Instruct \
-    --port 8000 \
-    --limit-mm-per-prompt image=1 \
-    --max-model-len 8192
-```
-
-Confirm it is up:
-
-```bash
-curl -s http://localhost:8000/v1/models | python3 -m json.tool
-```
-
-### 6. Benchmark before spending GPU-days
+## Part 4 — Benchmark before spending GPU-days
 
 ```bash
 python benchmark_vlm.py \
@@ -159,13 +228,13 @@ python benchmark_vlm.py \
     --n 50
 ```
 
-This costs about one GPU-hour and answers the four questions every estimate in
+Costs about one GPU-hour. Answers the four questions every estimate in
 `PRD.md` depends on:
 
 ```
 valid schema     47  (94%)
 bad schema        3  ( 6%)
-REFUSED           0  ( 0%)        ← should be 0 self-hosted
+REFUSED           0  ( 0%)        ← must be 0 self-hosted
 median latency   2.10s/page  (0.48 pages/sec, 1 stream)
   at 32 concurrent:   15.2 pg/s -> 222 h for full corpus
 ABBYY agreement  median 0.812
@@ -173,15 +242,17 @@ mean visual_elements/page 2.3     ← what pure OCR would have missed
 ```
 
 **Do not skip this.** Every throughput figure in the PRD is an estimate until
-you run it. If ABBYY agreement is high and visual_elements is near zero, vision
-is not earning its cost on your documents.
+you run it. If `visual_elements` comes back near zero, vision is not earning
+its cost on these documents and the architecture needs rethinking.
 
-### 7. Pilot on one program
+---
 
-Start with STARGATE (~90,000 pages, under $25) rather than 12.2 million. The
-architecture is identical; the corpus is a swappable input.
+## Part 5 — Pilot, then scale
 
-### 8. Check source coverage
+Start with one program (STARGATE, ~90,000 pages, under $25) rather than 12.2
+million. The architecture is identical; the corpus is a swappable input.
+
+Then check what you can actually obtain:
 
 ```bash
 python coverage_audit.py --n 500 --delay 0.4
@@ -194,33 +265,13 @@ honestly claim about completeness.** Current small samples disagree badly
 
 ---
 
-## Running with the Hermes agent harness
+## Part 6 — Run the learning loop
 
 The pipeline is deterministic code. The agent is a separate offline loop that
-reads failures and proposes improvements. Full detail in `AGENT_HARNESS.md`.
+reads failures and proposes improvements. Full detail in
+[`AGENT_HARNESS.md`](AGENT_HARNESS.md).
 
-### 1. Install Hermes
-
-```bash
-pip install hermes-agent     # or see https://hermes-agent.nousresearch.com/docs
-hermes setup
-```
-
-### 2. Install the skill
-
-```bash
-mkdir -p ~/.hermes/skills/research
-cp -r skills/cia-crest-archive ~/.hermes/skills/research/
-```
-
-Verify it loads:
-
-```bash
-hermes
-> What skills do you have for CREST?
-```
-
-### 3. Process a batch, then look at what failed
+### 6.1 Process a batch, then look at what failed
 
 ```bash
 python ingest.py --report
@@ -238,7 +289,10 @@ most common failure details (the agent's actual work queue)
       312x  visual_elements[0].type invalid: 'watermark'
 ```
 
-### 4. Hand the failures to the agent
+`ungrounded` is the one to watch — an entity absent from the transcription is a
+plausible fabrication carrying a real citation.
+
+### 6.2 Hand the failures to the agent
 
 ```bash
 hermes
@@ -250,9 +304,9 @@ Then run Task 1 — failure triage.
 ```
 
 The agent reads the report, inspects raw model output from
-`~/.hermes/data/crest-archive/quarantine/`, and tells you the root cause.
+`~/.hermes/data/crest-archive/quarantine/`, and reports the root cause.
 
-### 5. Approve a fix, then make the agent prove it
+### 6.3 Approve a fix, then make the agent prove it
 
 ```
 Run Task 2 — propose a prompt fix for the largest failure category.
@@ -270,9 +324,9 @@ python ingest.py --replay-all
 ```
 
 Prompt versions are hashed, so `--report` shows success rate per version. You
-compare, rather than assume.
+compare rather than assume.
 
-### 6. Optional — schedule it
+### 6.4 Optional — schedule it
 
 ```
 Create a cron job for every Monday 9am: run the CREST failure analysis cycle
@@ -289,6 +343,43 @@ from AGENT_HARNESS.md and report findings. Do not modify files; report only.
 2. **Fixes are proven with `--replay-all`.** The quarantine corpus is a
    regression suite. Assertion is not evidence.
 3. **A human merges.** The agent opens a diff with before/after numbers.
+
+---
+
+## What is here
+
+| Path | Purpose |
+|---|---|
+| `manifest/` | **The full 934,738-row CREST index, mirrored** (94 MB) |
+| `PRD.md` | Product requirements + full cost analysis, every figure sourced |
+| `AGENT_HARNESS.md` | The learning loop — five copy-paste agent prompts |
+| `schema.py` | JSON contract, prompt, validator, hallucination check |
+| `manifest_to_sqlite.py` | Manifest → indexed SQLite |
+| `fetch_document.py` | Fetch one document, preferring already-OCR'd sources |
+| `coverage_audit.py` | Measure the three-way source split |
+| `benchmark_vlm.py` | Benchmark a VLM before committing GPU-days |
+| `ingest.py` | Hot-path processing + quarantine + failure reporting |
+| `skills/` | The Hermes skill, installable with one `cp` |
+
+---
+
+## Key findings (so you don't repeat the work)
+
+**The full manifest already exists.** `morisy/ci-trend-explorer` — Michael
+Morisy founded MuckRock, whose lawsuit forced the CREST release. 94 MB,
+934,738 rows, every field populated. Mirrored here.
+
+**cia.gov is unusable programmatically.** Akamai Bot Manager returns a
+`bm-verify` challenge to every scripted request. The Wayback Machine's `id_`
+raw-content path serves the same PDFs without the wall.
+
+**Existing OCR exists but we do not rely on it.** archive.org holds 275,008
+CREST items with ABBYY OCR and per-word bounding boxes (`_djvu.xml`), free — a
+useful *reference* for benchmarking transcription quality. But it is text-only
+and covers an unresolved 23–88% of the corpus.
+
+**Wayback CREST PDFs have no text layer** (0 of 15 tested). Don't confuse them
+with `/readingroom/docs/` captures, which do — that's a different corpus.
 
 ---
 
