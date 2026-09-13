@@ -26,7 +26,7 @@ documents, and where do these reports overlap?"*
 | 1 | Identify people, places, events, timelines, images within reports | Entity + relation extraction over OCR text |
 | 2 | Identify overlaps across reports and historical events | Graph store; co-occurrence is a graph query, not a similarity search |
 | 3 | Search returns related info with citations linking to the actual PDF page | Word-level bounding boxes preserved from OCR through to the UI |
-| 4 | Present as a 3D knowledge graph | three.js / WebGL front end over a queryable API |
+| 4 | Present as a 3D knowledge graph | three.js over a queryable API. **Query-scoped only** — nothing renders until the user searches; hard cap ~2,000 nodes (§5.9.6) |
 
 ---
 
@@ -492,6 +492,205 @@ rather than assumed to improve.
 
 ---
 
+# 5.9 Phase two — storage, graph, and the 3D application
+
+Phase one ends with validated page records. This section covers what happens to
+them.
+
+## 5.9.1 The graph model
+
+**A node is an entity, not a page.** If "Allen Dulles" appears on six pages of
+one document, that is **one node** and **one edge**, carrying the mention count
+and the page list:
+
+```
+(Entity {name, type, canonical_id})
+   -[:MENTIONS {count: 6, pages: [3,4,7,11,12,19], first_page: 3}]->
+(Document {doc_id, title, date, page_count, content_type})
+```
+
+This is the difference between a graph you can render and one you cannot:
+
+| Model | Edges |
+|---|---|
+| One edge per mention | ~60.9M |
+| **Aggregated to (entity, document)** | **~11.7M** |
+
+A ~5.2× reduction, and nothing is lost — `pages[]` still drives citation, so a
+result can say *"mentioned 6 times, pages 3–19"* and deep-link each one.
+
+## 5.9.2 Co-occurrence is computed, never stored
+
+Requirement #2 — overlaps across reports — looks like it wants an edge between
+every pair of entities appearing together. It does not:
+
+| Entities/page | Materialised co-occurrence edges |
+|---|---|
+| 5 | 0.12 billion |
+| 8 | 0.34 billion |
+| 15 | 1.28 billion |
+
+A billion-edge graph is not queryable at interactive latency, and most of those
+edges are noise — two names on the same routing slip are not connected in any
+meaningful sense.
+
+Store `MENTIONS` only (~12M edges) and derive overlap at query time as a
+two-hop traversal from the *selected* entity:
+
+```cypher
+MATCH (e1 {canonical_id: $id})<-[:MENTIONS]-(d)-[:MENTIONS]->(e2)
+WHERE e2.canonical_id <> $id
+RETURN e2, count(d) AS shared_docs, collect(d.doc_id)[..20] AS examples
+ORDER BY shared_docs DESC LIMIT 300
+```
+
+Cost is bounded by the degree of one entity, not by the size of the graph.
+
+## 5.9.3 Entity resolution — the hard subsystem
+
+`Allen Dulles` / `DULLES` / `A. W. Dulles` / `the Director` / `DUL1E5` (OCR
+damage) must collapse to one `canonical_id`, or the graph fragments into
+thousands of near-duplicates and every overlap query returns nothing.
+
+This is a real subsystem, not a detail. Proposed cascade, cheapest first:
+
+```
+1. normalise      case, punctuation, honorifics, "LAST, FIRST" -> "FIRST LAST"
+2. exact match    on normalised form
+3. fuzzy          Levenshtein <=2 AND same entity type AND overlapping date range
+                  (guards against merging different people with similar names)
+4. embedding      cosine similarity on name+context for the remainder
+5. human review   a merge queue for high-degree entities only — getting
+                  "Allen Dulles" wrong corrupts thousands of edges; getting an
+                  obscure clerk wrong affects three
+```
+
+Coreference ("the Director" → whoever ran the Agency on that document's date)
+resolves at extraction time, where the VLM has the page context, not later.
+
+**Merges must be reversible.** Store the merge decision, not just the result,
+so a bad merge can be undone without re-running extraction.
+
+## 5.9.4 Vector store
+
+```
+18.3M vectors (1.5 chunks/page)
+
+  1536d float32   168 GB    needs a large, expensive machine
+   768d float32    84 GB    still heavy
+   768d int8       21 GB    fits in RAM on a $60/mo VPS
+```
+
+**Quantisation is not optional at this scale.** int8 with rescoring costs a few
+points of recall and turns the hosting bill from hundreds to tens.
+
+Embeddings run on the GPU already rented for the VLM: **$34–67 for the whole
+corpus** (bge-small 384d through bge-base 768d), cheaper than the $292 API
+estimate and avoiding a second content-filter exposure.
+
+## 5.9.5 Hybrid retrieval
+
+Neither store answers a real query alone:
+
+```
+query ──► embed ──► Qdrant: top-k chunks ──► doc_ids
+                                               │
+                    Neo4j: entities in those docs, their other documents
+                                               │
+                    merge ──► cited results + a subgraph for the 3D view
+```
+
+Semantic search finds documents that use different words; the graph finds what
+connects them. Requirement #3's citations come from the chunk payload
+(`doc_id` + `page`).
+
+## 5.9.6 The 3D view is query-scoped
+
+**Nothing renders until the user searches.** There is no "whole graph" view —
+it would be 3.2M nodes, which is both technically impossible and visually
+meaningless.
+
+```
+      1,000 nodes   smooth
+     10,000 nodes   fine with instancing
+    100,000 nodes   GPU copes, but the user is reading fog
+  3,200,000 nodes   impossible
+```
+
+Force-directed layout is O(n log n) *per frame*. The limit is not the GPU — it
+is human legibility.
+
+**Hard cap: ~2,000 nodes**, allocated per query:
+
+```
+    1   the focus entity
+  300   top co-occurring entities
+  600   top documents
+  400   second-degree entities (dimmed, context only)
+  699   headroom for click-to-expand
+```
+
+Documents are ranked into the 600 slots by mention count, entity density
+(documents rich in other entities make better graph hubs), date, page count,
+and IDF-style distinctiveness.
+
+### Hub entities need facets, not nodes
+
+```
+an obscure case officer        ~12 documents
+a mid-level program           ~400 documents
+"Soviet Union"             ~180,000 documents
+"CIA"                      ~600,000 documents
+```
+
+A search for *Soviet Union* must not attempt 180,000 nodes. Instead the UI
+shows the entity plus a **facet panel**: top 300 co-occurring entities, and a
+timeline histogram of the matching documents by year. The user drills —
+*Soviet Union + 1962 + PERSON* — and only then does the graph become a graph.
+
+**An over-broad query is a UI state, not an error.** The interface should make
+narrowing feel like exploration rather than failure.
+
+### Interaction model
+
+```
+search "Allen Dulles"
+  → focus node, sized by total mentions
+  → co-occurring entities orbit by shared-document count
+  → click an entity     : add its subgraph, respecting the cap
+  → click a document    : side panel, title/date/type + page thumbnails
+  → click a page        : open the PDF at that page — the citation payoff
+  → timeline scrub      : filter edges by document date, graph re-settles
+  → type filter         : PERSON / PLACE / PROGRAM / EVENT
+```
+
+Colour encodes entity type; node size encodes mention count; edge thickness
+encodes shared documents. Every visible element traces to a citable page.
+
+## 5.9.7 Monthly hosting
+
+| Component | Size | Cost |
+|---|---|---|
+| Qdrant self-hosted, 768d int8 | 21 GB | $60 |
+| Neo4j community, ~12M edges | ~40 GB | $40 |
+| PDF object store | 3.65 TB | $84 |
+| CDN egress | — | $30 |
+| **Total** | | **$214/mo** |
+
+Pinecone alone for 18M vectors would be $300–700/mo.
+
+## 5.9.8 Unmeasured assumptions
+
+Stated plainly, because they drive the numbers above:
+
+- **Entities per page (3/5/8)** is assumed. It changes graph size ~3×, and
+  `benchmark_vlm.py` reports the real figure. Run it before building.
+- **The 30:1 mention-to-unique-entity ratio** is a guess pending resolution.
+- **Hub document counts** are illustrative, not measured.
+- **Entity resolution quality** is unknown until tried on OCR-damaged names.
+
+---
+
 # 6. Risks
 
 | Risk | Evidence | Mitigation |
@@ -521,9 +720,10 @@ M2  Coverage validation        500 docs, 3-way source split (~20 min)
 M3  Pilot ingestion            STARGATE, ~90k pages, under $25
 M4  Extraction + graph         entities, relations, Neo4j, citation integrity
                                  + agent harness loop (AGENT_HARNESS.md)
-M5  Search API                 hybrid vector + graph, cited results
-M6  3D front end               three.js, query-scoped subgraphs
-M7  Full-corpus scale-out      5.6 GPU-days + 6-11 days acquisition, ~$3.5k
+M5  Entity resolution         canonical_id cascade + reversible merge log
+M6  Search API                 hybrid Qdrant + Neo4j, cited results
+M7  3D front end               three.js, query-scoped, 2k-node cap, facets
+M8  Full-corpus scale-out      5.6 GPU-days + 6-11 days acquisition, ~$2.4k
 ```
 
 **M1 costs about $2.50 and replaces every throughput estimate in this document
