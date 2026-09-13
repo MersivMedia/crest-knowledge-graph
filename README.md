@@ -1,4 +1,4 @@
-# CREST Knowledge Graph
+# CIA CREST Knowledge Graph
 
 Tooling to ingest the CIA's declassified **CREST** archive — 934,738 documents
 / 12,172,653 pages — into a citable, searchable knowledge graph, using a
