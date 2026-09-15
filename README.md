@@ -256,8 +256,8 @@ calls, the VLM makes 12 million.
 ### 3.1 Clone
 
 ```bash
-git clone https://github.com/MersivMedia/crest-knowledge-graph.git
-cd crest-knowledge-graph
+git clone https://github.com/MersivMedia/CIA-crest-knowledge-graph.git
+cd CIA-crest-knowledge-graph
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
