@@ -1,38 +1,139 @@
 # CIA CREST Knowledge Graph
 
 Tooling to ingest the CIA's declassified **CREST** archive — 934,738 documents
-/ 12,172,653 pages — into a citable, searchable knowledge graph, using a
-self-hosted vision-language model and a Hermes agent harness that learns from
-its own failures.
+/ 12,172,653 pages of scanned 1990s microfilm — into a citable, searchable
+knowledge graph. Every answer links back to the page image it came from.
 
-**Full corpus cost: ~$2,400.** Vision analysis runs over all 12,172,653 pages —
-we are not reusing anyone's OCR. That is a deliberate choice: existing OCR is
-text-only, and it silently discards the maps, photographs, stamps, seals,
-redaction bars and handwritten marginalia that make these documents
-intelligible. A VLM reads the page as a page.
-
-The cost is low because the work is self-hosted on rented GPUs (~$1,600 of
-compute) rather than billed per API call, and because the 934,738-row index
-already exists — mirrored in [`manifest/`](manifest/) so it cannot disappear.
+**Full corpus cost: ~$2,400**, self-hosted.
 
 ---
 
-## Why self-hosted, not an API
+## What this is built from, and why
 
-**Hosted APIs refuse this content.** Measured, not assumed: a production API
-declined to extract structured data from coup-operation material, stating it
-would refuse *"even if this were a real declassified document."*
+The naive approach to "search a document archive with AI" is to embed
+everything into a vector database and retrieve by similarity. That fails here
+for a specific reason, and the architecture is shaped around it.
+
+### The four layers
+
+| Layer | Tool | What it holds |
+|---|---|---|
+| **Page understanding** | Self-hosted Qwen3-VL (vision-language model) | Transcription, visual elements, and entities — one pass per page |
+| **Semantic search** | Qdrant, 768-dim int8 | ~18M passage embeddings for "find me things about X" |
+| **Relationships** | Neo4j | ~12M `MENTIONS` edges linking entities to the documents they appear in |
+| **Provenance** | Object store | The original PDFs, so every claim resolves to a page image |
+
+### Why a vision model instead of OCR
+
+CREST pages are scanned microfilm that the Agency never OCR'd. Conventional OCR
+would produce text — and silently discard the maps, photographs, stamps, seals,
+redaction bars and handwritten marginalia that often carry the actual meaning.
+A redaction bar is information. A routing stamp tells you who saw a document.
+
+So vision runs over **all 12.1M pages**, not just the ones without a text
+layer, and transcription, visual-element detection and entity extraction happen
+in a single model call per page rather than as three separate stages.
+
+### Why a graph *and* a vector store
+
+This is the central design decision, and neither component alone is sufficient.
+
+**Vector search answers "what is this about."** Embeddings find passages
+semantically near a query, including paraphrases and synonyms. What they cannot
+do is traverse. Ask "which other operations involved the people named in this
+cable" and similarity search has no mechanism to answer — the question is about
+*connections between* documents, not the content of any one of them.
+
+**Graph traversal answers "what connects to what."** That is the actual
+research question for a declassified archive: overlaps across reports, shared
+personnel, chains of reference. But a graph cannot answer "find documents about
+psychological conditioning" unless someone already tagged them that way.
+
+The two are therefore chained rather than chosen between:
+
+```
+query ──► embed ──► Qdrant: top-k passages ──► document ids
+                                                    │
+                            Neo4j: entities in those documents,
+                            and the other documents they appear in
+                                                    │
+                          cited results + a subgraph for the 3D view
+```
+
+Semantic search finds the entry points; the graph expands them into structure.
+
+### Why relationships are computed, not stored
+
+The obvious way to represent "these two entities are connected" is an explicit
+edge between them. At this scale that is fatal: linking every entity pair on
+every page produces **0.1–1.3 billion edges** depending on entity density, most
+of them meaningless — two names on the same routing slip are not related in any
+useful sense.
+
+Instead only `(Entity)-[:MENTIONS]->(Document)` is stored, about **12M edges**,
+and co-occurrence is derived at query time by a two-hop traversal. Cost is
+bounded by one entity's degree rather than by the size of the graph.
+
+A name appearing on six pages of one document is **one node**, with the page
+numbers carried on the edge — so a result can say "mentioned 6 times, pages
+3–19" and deep-link each one, without inflating the graph.
+
+### Why int8 quantisation is not optional
+
+```
+18.3M vectors @ 1536d float32   168 GB   needs a large dedicated machine
+18.3M vectors @  768d float32    84 GB   still expensive
+18.3M vectors @  768d int8       21 GB   fits in RAM on a $60/mo VPS
+```
+
+Quantisation with rescoring costs a few points of recall and moves the entire
+retrieval layer from "specialised infrastructure" to "one modest server."
+Total hosting lands near **$214/month** against $300–700 for a managed vector
+database alone.
+
+### Why the 3D view is query-scoped
+
+The graph contains roughly 3.2M entity nodes. Force-directed layout is
+O(n log n) *per frame*, and beyond about 10,000 nodes a human is reading fog
+rather than structure. Nothing renders until a search is made; each query
+returns at most **~2,000 nodes**. Broad queries — "Soviet Union" touches
+~180,000 documents — return a facet panel of co-occurring entities and a
+timeline to drill through, rather than an unreadable hairball.
+
+### Why self-hosted weights, not a hosted API
+
+**Measured, not assumed:** a production API declined to extract structured data
+from coup-operation material, stating it would refuse *"even if this were a
+real declassified document."*
 
 CREST is full of such material — PBSUCCESS, PBFORTUNE, ZRRIFLE, Phoenix,
-MKUltra. Refusals would cluster on exactly the documents researchers care about
-most, and they arrive as HTTP 200 with prose, so they land in the pipeline as
-malformed records rather than errors. An archive that silently omits the
-Guatemala coup while faithfully indexing cafeteria memos is worse than no
-archive.
+MKUltra. Refusals cluster on exactly the documents researchers care about most,
+and they arrive as HTTP 200 with prose, so they enter the pipeline as malformed
+records rather than as errors. An archive that silently omits the Guatemala
+coup while faithfully indexing cafeteria memos is worse than no archive.
 
-Open weights on your own GPU have no policy layer, are deterministic at
+Open weights on rented GPUs have no policy layer, are deterministic at
 `temperature=0`, and cannot be deprecated mid-project. Full evidence in
 [`PRD.md`](PRD.md) §4.2.
+
+### Why an agent harness sits around it
+
+12.1M pages will produce malformed output, hallucinated entities and refusal-like
+failures at some rate. The pipeline is deterministic on the hot path; every
+failure is quarantined as replayable JSON with the raw model output. A Hermes
+agent then reads the accumulated failures **offline**, finds patterns, and
+proposes prompt or schema fixes that a human merges.
+
+Two hard rules: the agent never runs per-page (slow, costly, irreproducible),
+and the agent never edits the validator — asked to reduce failures, an agent
+relaxes the constraint instead of meeting it. See
+[`AGENT_HARNESS.md`](AGENT_HARNESS.md).
+
+### Why the cost is low
+
+Self-hosted on rented GPUs (~$1,600 of compute) rather than billed per API
+call, and the 934,738-row index already exists — mirrored in
+[`manifest/`](manifest/) so it cannot disappear.
 
 ---
 
